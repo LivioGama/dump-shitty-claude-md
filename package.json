@@ -1,6 +1,6 @@
 {
   "name": "dump-shitty-claude-md",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Migrate project CLAUDE.md files to AGENTS.md across all repos in your home directory",
   "keywords": [
     "claude",

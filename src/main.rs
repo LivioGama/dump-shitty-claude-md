@@ -69,6 +69,11 @@ struct Cli {
     /// Descend into symlinked directories (default: skip — avoids loops)
     #[arg(long)]
     follow_links: bool,
+
+    /// When to use ANSI colors [default: auto — on for terminals, off when
+    /// piped; NO_COLOR env also disables]
+    #[arg(long, value_enum, default_value = "auto")]
+    color: ColorWhen,
 }
 
 #[derive(Serialize)]
@@ -271,24 +276,107 @@ fn build_plans(
     (plans, strays)
 }
 
-fn print_row(repo: &str, file: &str, label: &str, reason: &str, warnings: &[String], nested: &[PathBuf]) {
-    let mark = match label {
-        "skip" => "!",
-        "merge" | "replace" => "~",
-        _ => "✓",
-    };
-    println!("{mark} {label:<8} {repo:<44} {reason}");
-    if file != "CLAUDE.md" && !file.is_empty() {
-        println!("  {:<10} {:<44} file: {file}", "", "");
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ColorWhen {
+    Auto,
+    Always,
+    Never,
+}
+
+fn colorize(value: &str, color: &str, enabled: bool) -> String {
+    if enabled {
+        format!("\x1b[{color}m{value}\x1b[0m")
+    } else {
+        value.to_owned()
     }
-    for w in warnings {
-        println!("  {:<10} {:<44} ⚠ {w}", "", "");
+}
+
+/// Fixed-width "✓ label   " badge — every row starts with one so columns
+/// line up across plan/stray/variant/ignored lines.
+fn badge(mark: &str, label: &str, code: &str, on: bool) -> String {
+    colorize(&format!("{mark} {label:<8}"), code, on)
+}
+
+/// One table row: badge + path + reason, plus indented detail lines
+/// (file:/⚠/nested:) printed under the reason column.
+struct TRow {
+    mark: &'static str,
+    label: String,
+    code: &'static str,
+    path: String,
+    reason: String,
+    subs: Vec<(String, bool)>, // (text, is_warning)
+}
+
+fn mark_code(label: &str) -> (&'static str, &'static str) {
+    match label {
+        "skip" => ("!", "1;31"),
+        "merge" | "replace" => ("~", "1;33"),
+        _ => ("✓", "1;32"),
     }
-    for n in nested.iter().take(5) {
-        println!("  {:<10} {:<44} nested: {}", "", "", shorten(n));
+}
+
+/// Middle-ellipsis for paths longer than the column: keeps the repo name
+/// (the end) and the leading ~/ (the start) visible.
+fn ellipsize(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_owned();
     }
-    if nested.len() > 5 {
-        println!("  {:<10} {:<44} … +{} more nested", "", "", nested.len() - 5);
+    let keep = max - 1;
+    let head = keep / 2;
+    let tail = keep - head;
+    let h: String = s.chars().take(head).collect();
+    let t: String = s.chars().skip(n - tail).collect();
+    format!("{h}…{t}")
+}
+
+fn print_table(rows: &[TRow], on: bool) {
+    if rows.is_empty() {
+        return;
+    }
+    let w = rows
+        .iter()
+        .map(|r| r.path.chars().count())
+        .max()
+        .unwrap_or(4)
+        .max(4)
+        .min(60);
+    println!(
+        "{}",
+        colorize(&format!("  {:<8} {:<w$} REASON", "ACTION", "PATH"), "1", on)
+    );
+    for r in rows {
+        println!(
+            "{} {} {}",
+            badge(r.mark, &r.label, r.code, on),
+            colorize(&format!("{:<w$}", ellipsize(&r.path, w)), "36", on),
+            colorize(&r.reason, "2", on),
+        );
+        for (sub, warn) in &r.subs {
+            let code = if *warn { "33" } else { "2" };
+            println!(
+                "{}",
+                colorize(&format!("{}{}", " ".repeat(12 + w), sub), code, on)
+            );
+        }
+    }
+}
+
+fn trow(
+    mark: &'static str,
+    label: &str,
+    code: &'static str,
+    path: &std::path::Path,
+    reason: &str,
+) -> TRow {
+    TRow {
+        mark,
+        label: label.into(),
+        code,
+        path: shorten(path),
+        reason: reason.into(),
+        subs: vec![],
     }
 }
 
@@ -353,58 +441,116 @@ fn main() -> anyhow::Result<()> {
                 "rule_dirs": scan.rule_dirs,
                 "gitignored": scan.gitignored,
                 "ignored_agents": scan.ignored_agents,
+                "worktrees": scan.worktrees,
                 "scan_errors": scan.errors,
             }))?
         );
         return Ok(());
     }
 
+    let color_enabled = match cli.color {
+        ColorWhen::Always => true,
+        ColorWhen::Never => false,
+        ColorWhen::Auto => {
+            std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+        }
+    };
+    let path_c = |p: &std::path::Path| colorize(&format!("{:<44}", shorten(p)), "36", color_enabled);
+    let dim = |s: &str| colorize(s, "2", color_enabled);
+
     println!(
         "{} — {} instruction file{} in repos, {} stray{}",
-        if dry { "DRY RUN" } else { "RUN" },
-        plans.len(),
+        colorize(
+            if dry { "DRY RUN" } else { "RUN" },
+            if dry { "1;36" } else { "1;33" },
+            color_enabled
+        ),
+        colorize(&plans.len().to_string(), "1", color_enabled),
         if plans.len() == 1 { "" } else { "s" },
-        strays.len(),
+        colorize(&strays.len().to_string(), "1", color_enabled),
         if strays.len() == 1 { "" } else { "s" }
     );
 
+    let mut rows: Vec<TRow> = Vec::new();
     for p in &plans {
-        print_row(
-            &shorten(&p.repo),
-            &p.file.to_string_lossy(),
-            p.action.label(),
-            &p.reason,
-            &p.warnings,
-            &p.nested,
-        );
+        let (mark, code) = mark_code(p.action.label());
+        let mut r = trow(mark, p.action.label(), code, &p.repo, &p.reason);
+        let file = p.file.to_string_lossy();
+        if file != "CLAUDE.md" && !file.is_empty() {
+            r.subs.push((format!("file: {file}"), false));
+        }
+        for w in &p.warnings {
+            r.subs.push((format!("⚠ {w}"), true));
+        }
+        for n in p.nested.iter().take(5) {
+            r.subs.push((format!("nested: {}", shorten(n)), false));
+        }
+        if p.nested.len() > 5 {
+            r.subs.push((format!("… +{} more nested", p.nested.len() - 5), false));
+        }
+        rows.push(r);
     }
     for s in &strays {
-        println!("! stray    {:<44} not inside a git repo", shorten(s));
+        rows.push(trow("!", "stray", "1;31", s, "not inside a git repo"));
     }
     for v in &scan.variants {
-        println!("! variant  {:<44} non-standard spelling — no agent reads this", shorten(v));
-    }
-    for p in &scan.protected {
-        println!("· global   {:<44} protected — left alone", shorten(p));
-    }
-    for g in &scan.gitignored {
-        println!("· ignored  {:<44} gitignored — personal file, left alone", shorten(g));
+        rows.push(trow(
+            "!",
+            "variant",
+            "1;31",
+            v,
+            "non-standard spelling — no agent reads this",
+        ));
     }
     for d in &scan.rule_dirs {
-        println!("! rules    {:<44} tool-specific rule dir — not migratable", shorten(d));
+        rows.push(trow(
+            "!",
+            "rules",
+            "1;31",
+            d,
+            "tool-specific rule dir — not migratable",
+        ));
+    }
+    if !rows.is_empty() || !scan.errors.is_empty() {
+        println!("\n{}", colorize("MIGRATION PLAN & NOTES", "1;36", color_enabled));
+        print_table(&rows, color_enabled);
     }
     for e in &scan.errors {
-        eprintln!("  scan error: {e}");
+        eprintln!("{}", colorize(&format!("  scan error: {e}"), "31", color_enabled));
+    }
+
+    let mut irows: Vec<TRow> = Vec::new();
+    for p in &scan.protected {
+        irows.push(trow("·", "global", "2", p, "protected"));
+    }
+    for g in &scan.gitignored {
+        irows.push(trow("·", "ignored", "2", g, "gitignored — personal file"));
+    }
+    for w in &scan.worktrees {
+        irows.push(trow(
+            "·",
+            "worktree",
+            "2",
+            w,
+            "linked worktree — migrate the main checkout",
+        ));
+    }
+    if !irows.is_empty() {
+        println!("\n{}", colorize("IGNORED — left alone", "1;36", color_enabled));
+        print_table(&irows, color_enabled);
     }
 
     if dry {
         println!(
-            "\ndry run — rerun with --apply (files) or --pr (files + branch + PR){}",
-            if strays.is_empty() {
-                ""
-            } else {
-                " · --trash-strays removes strays"
-            }
+            "{}",
+            dim(&format!(
+                "\ndry run — rerun with --apply (files) or --pr (files + branch + PR){}",
+                if strays.is_empty() {
+                    ""
+                } else {
+                    " · --trash-strays removes strays"
+                }
+            ))
         );
         return Ok(());
     }
@@ -419,7 +565,12 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
         if cli.trivial && !p.action.is_trivial() {
-            println!("- held     {:<44} merge — rerun without --trivial", shorten(&p.repo));
+            println!(
+                "{} {} {}",
+                badge("-", "held", "1;33", color_enabled),
+                path_c(&p.repo),
+                dim("merge — rerun without --trivial")
+            );
             counts.2 += 1;
             continue;
         }
@@ -431,11 +582,20 @@ fn main() -> anyhow::Result<()> {
             match plan::apply(&p.repo, &p.file, p.action) {
                 Ok(()) => {
                     counts.0 += 1;
-                    println!("✓ {:<8} {}{}", p.action.label(), shorten(&p.repo), file_suffix(p));
+                    println!(
+                        "{} {}{}",
+                        badge("✓", p.action.label(), "1;32", color_enabled),
+                        colorize(&shorten(&p.repo), "36", color_enabled),
+                        dim(&file_suffix(p))
+                    );
                 }
                 Err(e) => {
                     failures += 1;
-                    eprintln!("✗ {:<44} {e:#}", shorten(&p.repo));
+                    eprintln!(
+                        "{} {}",
+                        colorize("✗", "1;31", color_enabled),
+                        colorize(&format!("{:<44} {e:#}", shorten(&p.repo)), "31", color_enabled)
+                    );
                 }
             }
         }
@@ -455,15 +615,21 @@ fn main() -> anyhow::Result<()> {
             }) {
                 Some(s) => s,
                 None => {
-                    println!("- skipped  {}", shorten(&repo));
+                    println!(
+                        "{} {}",
+                        badge("-", "skipped", "1;33", color_enabled),
+                        path_c(&repo)
+                    );
                     counts.2 += 1;
                     continue;
                 }
             };
             if strategy == gitops::Strategy::InPlace && !clean {
                 println!(
-                    "! {:<44} dirty tree — in-place refused, use worktree",
-                    shorten(&repo)
+                    "{} {} {}",
+                    badge("!", "skip", "1;31", color_enabled),
+                    path_c(&repo),
+                    dim("dirty tree — in-place refused, use worktree")
                 );
                 counts.2 += 1;
                 continue;
@@ -475,19 +641,24 @@ fn main() -> anyhow::Result<()> {
             } else {
                 counts.0 += 1;
             }
-            let mut line = format!("✓ migrated {}", shorten(&repo));
+            let line = format!(
+                "{} {}",
+                colorize("✓ migrated", "1;32", color_enabled),
+                colorize(&shorten(&repo), "36", color_enabled)
+            );
+            let mut detail = String::new();
             if outcome.committed {
-                line.push_str(&format!("  → {}", outcome.branch.clone().unwrap_or_default()));
+                detail.push_str(&format!("  → {}", outcome.branch.clone().unwrap_or_default()));
             }
             if outcome.pushed {
-                line.push_str(" pushed");
+                detail.push_str(" pushed");
             }
             if let Some(u) = &outcome.pr_url {
-                line.push_str(&format!("  PR: {u}"));
+                detail.push_str(&format!("  PR: {u}"));
             }
-            println!("{line}");
+            println!("{}{}", line, dim(&detail));
             for w in &outcome.warnings {
-                println!("  ⚠ {w}");
+                println!("{}", colorize(&format!("  ⚠ {w}"), "33", color_enabled));
             }
         }
     }
@@ -511,11 +682,24 @@ fn main() -> anyhow::Result<()> {
                 match trash::delete(s) {
                     Ok(()) => {
                         trashed += 1;
-                        println!("🗑 stray    {} → Trash", shorten(s));
+                        println!(
+                            "{} {} {}",
+                            colorize("🗑 stray", "1;35", color_enabled),
+                            colorize(&shorten(s), "36", color_enabled),
+                            dim("→ Trash")
+                        );
                     }
                     Err(e) => {
                         failures += 1;
-                        eprintln!("✗ {:<44} trash failed: {e}", shorten(s));
+                        eprintln!(
+                            "{} {}",
+                            colorize("✗", "1;31", color_enabled),
+                            colorize(
+                                &format!("{:<44} trash failed: {e}", shorten(s)),
+                                "31",
+                                color_enabled
+                            )
+                        );
                     }
                 }
             }
@@ -523,15 +707,22 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!(
-        "\ndone: {} migrated, {} PRs, {} skipped{}",
-        counts.0,
-        counts.1,
-        counts.2,
-        if trashed > 0 {
-            format!(", {trashed} trashed")
-        } else {
-            String::new()
-        }
+        "{}",
+        colorize(
+            &format!(
+                "\ndone: {} migrated, {} PRs, {} skipped{}",
+                counts.0,
+                counts.1,
+                counts.2,
+                if trashed > 0 {
+                    format!(", {trashed} trashed")
+                } else {
+                    String::new()
+                }
+            ),
+            if failures == 0 { "1;32" } else { "1;33" },
+            color_enabled
+        )
     );
     if failures > 0 {
         std::process::exit(1);
@@ -546,5 +737,26 @@ fn file_suffix(p: &Plan) -> String {
         String::new()
     } else {
         format!("  ({})", p.file.display())
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::{badge, colorize};
+
+    #[test]
+    fn badge_pads_label_to_fixed_width() {
+        assert_eq!(badge("!", "stray", "1;31", false), "! stray   ");
+        assert_eq!(badge("✓", "rename", "1;32", false).chars().count(), 10);
+    }
+
+    #[test]
+    fn colorize_omits_ansi_when_output_is_not_a_terminal() {
+        assert_eq!(colorize("✓ rename", "32", false), "✓ rename");
+    }
+
+    #[test]
+    fn colorize_wraps_terminal_output_in_ansi_color() {
+        assert_eq!(colorize("✓ rename", "32", true), "\x1b[32m✓ rename\x1b[0m");
     }
 }

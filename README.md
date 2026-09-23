@@ -8,13 +8,19 @@ bunx dump-shitty-claude-md
 
 ```
 DRY RUN — 290 CLAUDE.md in repos, 25 strays
-✓ dedupe   ~/code/api-server                          identical content → delete CLAUDE.md
-~ merge    ~/code/dashboard                           content differs → append CLAUDE.md into AGENTS.md
-✓ rename   ~/code/cli-tool                            no AGENTS.md — rename
-! skip     ~/code/dotfiles                            CLAUDE.md is a symlink — left alone
-! stray    ~/Desktop/playground/CLAUDE.md               not inside a git repo
-· global   ~/CLAUDE.md                                  protected — left alone
+MIGRATION PLAN & NOTES
+  ACTION   PATH                           REASON
+✓ dedupe   ~/code/api-server              identical content → delete CLAUDE.md
+~ merge    ~/code/dashboard               content differs → append CLAUDE.md into AGENTS.md
+✓ rename   ~/code/cli-tool                no AGENTS.md — rename
+! skip     ~/code/dotfiles                CLAUDE.md is a symlink — left alone
+! stray    ~/Desktop/playground/CLAUDE.md not inside a git repo
+IGNORED — left alone
+  ACTION   PATH                           REASON
+· global   ~/CLAUDE.md                    protected
 ```
+
+Output is colored in terminals (`--color always|auto|never`, `NO_COLOR` honored); ignored files are grouped separately.
 
 ## 🧠 The decision matrix
 
@@ -30,6 +36,7 @@ Every file is classified before anything is touched:
 | symlink | any | skip + report |
 | bare repo / FIFO / socket | — | skip + report |
 | outside a git repo | — | never touched (Trash is opt-in) |
+| inside a linked worktree | — | ignored — the main checkout gets migrated |
 | `~/CLAUDE.md`, `~/.claude/**` | — | protected, never touched |
 
 Also warns on: `@import` syntax, `CLAUDE.local.md`, `AGENTS.local.md`,

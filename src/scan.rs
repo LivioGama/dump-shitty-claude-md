@@ -268,6 +268,10 @@ pub struct ScanResult {
     /// Repo roots whose AGENTS.md path is gitignored — a merge/rename there
     /// produces a file `--pr` can't commit. Surfaced as a plan warning.
     pub ignored_agents: BTreeSet<PathBuf>,
+    /// Linked-worktree checkouts (`.git` file → `…/.git/worktrees/…`) — their
+    /// instruction files are diverted here, never migrated: the main
+    /// checkout is the one that gets the AGENTS.md.
+    pub worktrees: Vec<PathBuf>,
     /// Walker errors (permission denied etc.), capped.
     pub errors: Vec<String>,
 }
@@ -379,11 +383,31 @@ pub fn scan(root: &Path, excludes: &[PathBuf], follow_links: bool) -> Result<Sca
 
     let mut found = found.into_inner().unwrap();
     found.sort_by(|a, b| a.path.cmp(&b.path));
+
+    // Linked worktrees share the main checkout's AGENTS.md — migrating them
+    // separately would double-apply. Drop their files entirely; report the
+    // worktree root so the user sees it was deliberately ignored.
+    let worktrees: BTreeSet<PathBuf> = found
+        .iter()
+        .filter_map(|f| f.repo_root.clone())
+        .filter(|r| is_linked_worktree(r))
+        .collect();
+    if !worktrees.is_empty() {
+        found.retain(|f| {
+            f.repo_root
+                .as_ref()
+                .is_none_or(|r| !worktrees.contains(r))
+        });
+    }
+    let worktrees: Vec<PathBuf> = worktrees.into_iter().collect();
+
     let mut variants = variants.into_inner().unwrap();
     variants.sort();
-    let mut rule_dirs = rule_dirs.into_inner().unwrap();
+    let mut rule_dirs: Vec<PathBuf> = rule_dirs.into_inner().unwrap();
     rule_dirs.sort();
     rule_dirs.dedup();
+    // Rule dirs inside a worktree are ignored along with the worktree.
+    rule_dirs.retain(|d| !worktrees.iter().any(|w| d.starts_with(w)));
 
     // .gitignore evaluation — a gitignored root instruction file is a
     // personal file; renaming it would un-ignore (and possibly commit) it.
@@ -426,8 +450,24 @@ pub fn scan(root: &Path, excludes: &[PathBuf], follow_links: bool) -> Result<Sca
         rule_dirs,
         gitignored,
         ignored_agents,
+        worktrees,
         errors: errors.into_inner().unwrap(),
     })
+}
+
+/// A linked worktree's `.git` is a file containing
+/// `gitdir: <main>/.git/worktrees/<name>`. Submodules point into
+/// `.git/modules/` instead — those are real repos and stay in scope.
+/// Anything else (`.git` dir, unreadable/foreign content) is a normal repo.
+fn is_linked_worktree(root: &Path) -> bool {
+    let git = root.join(".git");
+    if !git.is_file() {
+        return false;
+    }
+    std::fs::read_to_string(&git)
+        .ok()
+        .and_then(|s| s.trim().strip_prefix("gitdir:").map(str::trim).map(String::from))
+        .is_some_and(|d| d.replace('\\', "/").contains("/worktrees/"))
 }
 
 /// Nearest ancestor (starting at `dir`) containing a `.git` entry
@@ -485,6 +525,35 @@ mod tests {
                 f.label()
             );
         }
+    }
+
+    #[test]
+    fn linked_worktree_detection() {
+        let base = std::env::temp_dir().join(format!("dscm-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Linked worktree: .git file → gitdir: …/.git/worktrees/x
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            "gitdir: /repos/main/.git/worktrees/wt\n",
+        )
+        .unwrap();
+        assert!(is_linked_worktree(&wt));
+
+        // Submodule: .git file → gitdir: …/.git/modules/x — real repo, kept.
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        assert!(!is_linked_worktree(&sub));
+
+        // Normal checkout: .git directory.
+        let main = base.join("main");
+        std::fs::create_dir_all(main.join(".git")).unwrap();
+        assert!(!is_linked_worktree(&main));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
