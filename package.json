@@ -1,0 +1,38 @@
+{
+  "name": "dump-shitty-claude-md",
+  "version": "0.1.0",
+  "description": "Migrate project CLAUDE.md files to AGENTS.md across all repos in your home directory",
+  "keywords": [
+    "claude",
+    "agents-md",
+    "claude-md",
+    "codex",
+    "copilot",
+    "agent",
+    "cli"
+  ],
+  "bin": {
+    "dump-shitty-claude-md": "bin/dump-shitty-claude-md.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "cargo build --release && mkdir -p bin/$(node -p 'process.platform')-$(node -p 'process.arch') && cp target/release/dump-shitty-claude-md bin/$(node -p 'process.platform')-$(node -p 'process.arch')/",
+    "test": "cargo test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "license": "MIT"
+}

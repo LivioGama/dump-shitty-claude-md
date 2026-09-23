@@ -1,0 +1,198 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Build jobs only read the checkout. Write access is granted to the
+# publish job alone, which creates the GitHub release and runs npm publish.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Gate: the tag must name the version in Cargo.toml AND package.json, and
+  # the test suite must pass on the tagged commit. CI does not run on tag
+  # pushes, so this is the only check a release goes through.
+  verify:
+    name: Verify tag and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      - name: Tag matches Cargo.toml and package.json
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO_V=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          NPM_V=$(node -p "require('./package.json').version")
+          if [ "$TAG" != "$CARGO_V" ] || [ "$TAG" != "$NPM_V" ]; then
+            echo "::error::tag v$TAG but Cargo.toml=$CARGO_V package.json=$NPM_V"
+            exit 1
+          fi
+
+      - name: Test
+        run: cargo test --locked
+
+  # One job per npm platform dir. The binary lands in bin/<platform>-<arch>/
+  # which is exactly the layout bin/dump-shitty-claude-md.js resolves at
+  # runtime, so `npm pack` on the publish job ships a ready-to-run package.
+  build:
+    name: Build ${{ matrix.plat }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - triple: aarch64-apple-darwin
+            plat: darwin-arm64
+            os: macos-latest
+          - triple: x86_64-apple-darwin
+            plat: darwin-x64
+            os: macos-latest
+          - triple: x86_64-unknown-linux-gnu
+            plat: linux-x64
+            os: ubuntu-latest
+          - triple: aarch64-unknown-linux-gnu
+            plat: linux-arm64
+            os: ubuntu-24.04-arm
+          - triple: x86_64-pc-windows-msvc
+            plat: win32-x64
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.triple }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.triple }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.triple }}
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          EXE=dump-shitty-claude-md
+          case "${{ matrix.triple }}" in *windows*) EXE=$EXE.exe;; esac
+          mkdir -p "bin/${{ matrix.plat }}"
+          cp "target/${{ matrix.triple }}/release/$EXE" "bin/${{ matrix.plat }}/"
+
+      - name: Smoke the binary
+        shell: bash
+        run: |
+          EXE="bin/${{ matrix.plat }}/dump-shitty-claude-md"
+          [ "${{ matrix.plat }}" = "win32-x64" ] && EXE="$EXE.exe"
+          OUT="$("$EXE" --version)"
+          echo "$OUT"
+          echo "$OUT" | grep -Fqx "dump-shitty-claude-md ${GITHUB_REF_NAME#v}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bin-${{ matrix.plat }}
+          path: bin/${{ matrix.plat }}/
+
+  publish:
+    name: npm pack + publish + release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      # Granular npm access token (Automation type). When unset, the packed
+      # tarball is still attached to the GitHub release and a warning is
+      # emitted instead of failing the release.
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Download all platform binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: bin-*
+          path: bin
+          merge-multiple: false
+
+      - name: Reassemble bin/ layout
+        run: |
+          # artifacts land as bin/bin-<plat>/<files> → move to bin/<plat>/
+          for d in bin/bin-*; do
+            plat="${d#bin/bin-}"
+            mkdir -p "bin/$plat"
+            mv "$d"/* "bin/$plat/"
+            rmdir "$d"
+          done
+          ls -R bin/
+
+      - name: Pack
+        run: |
+          chmod +x bin/*/*
+          npm pack
+          mv dump-shitty-claude-md-*.tgz package.tgz
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          files: package.tgz
+
+      - name: Publish to npm
+        if: env.NODE_AUTH_TOKEN != ''
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+          npm publish package.tgz --access public
+
+      - name: npm skipped (no token)
+        if: env.NODE_AUTH_TOKEN == ''
+        run: |
+          echo "::warning::NPM_TOKEN is not set; publish by hand: npm publish package.tgz --access public"
+
+  # Post-publish smoke: install the just-published package exactly the way
+  # the README says — bunx — on two platforms, and check --version matches
+  # the tag. Skipped entirely when the npm publish step did not run.
+  smoke:
+    name: bunx smoke ${{ matrix.os }}
+    needs: publish
+    env:
+      NPM_TOKEN_SET: ${{ secrets.NPM_TOKEN }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+          - os: ubuntu-latest
+    steps:
+      # Job-level `if` cannot read env/secrets — the guard lives on the steps.
+      - name: Skip (no NPM_TOKEN)
+        if: env.NPM_TOKEN_SET == ''
+        run: echo "NPM_TOKEN is not set — bunx smoke skipped (npm publish did not run)."
+      - name: Install bun
+        if: env.NPM_TOKEN_SET != ''
+        uses: oven-sh/setup-bun@v2
+      - name: bunx from the registry
+        if: env.NPM_TOKEN_SET != ''
+        run: |
+          OUT="$(bunx dump-shitty-claude-md@${GITHUB_REF_NAME#v} --version)"
+          echo "$OUT"
+          echo "$OUT" | grep -Fqx "dump-shitty-claude-md ${GITHUB_REF_NAME#v}"
